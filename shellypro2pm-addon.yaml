@@ -1,0 +1,790 @@
+# Board: Shelly Pro 2
+# Definition: definitions/boards/shelly_pro_2/manifest.yaml
+
+substitutions:
+  device_name: "shellypro2pm-addon"
+  friendly_name: "ShellyPro2PM-addon"
+
+  # --- Hardware Pins (Adjust to match your main controller board) ---
+  pin_uart_tx: "GPIO1"
+  pin_uart_rx: "GPIO3"
+  pin_addon_en: "GPIO0"
+
+  # --- Add-on Hardware Timing ---
+  en_pwm_frequency: "9600Hz"
+  en_pwm_duty: "30%"          # 32 us HIGH / 73 us LOW
+  poll_interval_ms: "100ms"    # Safe round-robin pacing (1 command per tick)
+
+  # --- Feature Toggles ---
+  poll_dht22_ch0: "false"      # NEU: DHT22 auf CH0 abfragen
+  poll_dht22_ch1: "false"      # Set to "false" if no DHT22 is used on CH1
+
+  # --- Analog Input Scaling (Adjust to match your ADC / Voltage divider) ---
+  analog0_max_raw: "3300.0"
+  analog0_max_v: "3.3"
+  analog1_max_raw: "3300.0"
+  analog1_max_v: "3.3"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    priority: -100
+    then:
+      # 1. Start 9.6 kHz Enable PWM signal
+      - output.set_level:
+          id: addon_en_pwm
+          level: ${en_pwm_duty}
+      # 3. Wait for STM32 boot (~3.2s) then scan both 1-Wire buses
+      - delay: 3200ms
+      - script.execute: scan_buses_script
+
+esp32:
+  variant: esp32
+  framework:
+    type: esp-idf
+    advanced:
+      flash_chip: generic
+      sram1_as_iram: true
+  flash_mode: dio
+  flash_size: 8MB
+ 
+logger:
+  baud_rate: 0
+  level: INFO
+  
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    encryption:
+      
+ethernet:
+  type: LAN8720
+  mdc_pin: GPIO23
+  mdio_pin: GPIO18
+  clk:
+    mode: CLK_OUT
+    pin: 17
+  on_connect:
+    - switch.turn_on: lan_led_green
+  on_disconnect:
+    - switch.turn_off: lan_led_green
+    
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: ${device_name}
+    password: !secret ap_password
+  on_connect:
+    - switch.turn_off:
+        id: wifi_led_red
+    - switch.turn_on: 
+        id: wifi_led_green
+
+  on_disconnect:
+    - switch.turn_off:
+        id: wifi_led_green
+    - switch.turn_on:
+        id: wifi_led_red
+
+captive_portal:
+  
+uart:
+  - id: uart_bus_1
+    tx_pin: ${pin_uart_tx}
+    rx_pin: ${pin_uart_rx}
+    baud_rate: 57600
+    rx_buffer_size: 512
+
+spi:
+  clk_pin: GPIO14
+  mosi_pin: GPIO13
+  miso_pin:
+    number: GPIO12
+    ignore_strapping_warning: true
+
+button:
+  - platform: shutdown
+    id: do_shutdown
+  - platform: restart
+    name: "Restart"
+    id: do_restart
+
+  - platform: template
+    name: "Scan 1-Wire Buses"
+    icon: "mdi:magnify-scan"
+    on_press:
+      - script.execute: scan_buses_script
+
+binary_sensor:
+  - platform: gpio
+    id: reset_button
+    pin:
+      number: 35
+      inverted: true
+    on_release:
+      then:
+        button.press: do_restart
+
+  - platform: gpio
+    id: input1
+    pin:
+      number: 38
+    on_press:
+      then:
+        switch.toggle: relay1
+
+  - platform: gpio
+    id: input2
+    pin:
+      number: 39
+    on_press:
+      then:
+        switch.toggle: relay2
+
+  - platform: template
+    name: "Digital IO0"
+    id: addon_io0
+
+  - platform: template
+    name: "Digital IO1"
+    id: addon_io1
+
+  - platform: template
+    name: "Addon Relay State"
+    id: addon_relay_state
+
+globals:
+  - id: ch0_roms
+    type: std::vector<std::vector<uint8_t>>
+    restore_value: no
+  - id: ch1_roms
+    type: std::vector<std::vector<uint8_t>>
+    restore_value: no
+  - id: poll_index
+    type: uint8_t
+    initial_value: '0'
+  - id: is_scanning
+    type: bool
+    initial_value: 'false'
+
+sensor:
+  - platform: adc
+    id: temp_voltage1
+    pin: GPIO36
+    attenuation: auto
+  - platform: resistance
+    id: temp_resistance1
+    sensor: temp_voltage1
+    configuration: DOWNSTREAM
+    resistor: 10kOhm
+  - platform: ntc
+    sensor: temp_resistance1
+    name: Temperature 1
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    icon: "mdi:thermometer"
+    calibration:
+      b_constant: 3350
+      reference_resistance: 10kOhm
+      reference_temperature: 298.15K
+    on_value_range:
+      - above: 90
+        then:
+          - switch.turn_off: relay1
+          - switch.turn_off: relay2
+          - button.press: do_shutdown
+  - platform: adc
+    id: temp_voltage2
+    pin: GPIO37
+    attenuation: auto
+  - platform: resistance
+    id: temp_resistance2
+    sensor: temp_voltage2
+    configuration: DOWNSTREAM
+    resistor: 10kOhm
+  - platform: ntc
+    sensor: temp_resistance2
+    name: Temperature 2
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    icon: "mdi:thermometer"
+    calibration:
+      b_constant: 3350
+      reference_resistance: 10kOhm
+      reference_temperature: 298.15K
+    on_value_range:
+      - above: 90
+        then:
+          - switch.turn_off: relay1
+          - switch.turn_off: relay2
+          - button.press: do_shutdown
+
+  - platform: ade7953_spi
+    id: ade7953_1
+    cs_pin:
+      number: GPIO0
+      allow_other_uses: true
+      ignore_strapping_warning: true
+    voltage:
+      id: voltage1
+      name: "Voltage 1"
+    current_a:
+      id: current1
+      name: "Current 1"
+      filters:
+        - lambda: |-
+            if (x <= 0.02) return 0;
+            return x;
+    active_power_a:
+      id: power1
+      name: "Power 1"
+      filters:
+        - multiply: -1
+        - lambda: |-
+            if (x <= 0.2) return 0;
+            return x;
+
+  - platform: ade7953_spi
+    id: ade7953_2
+    cs_pin:
+      number: GPIO15
+      ignore_strapping_warning: true
+    voltage:
+      id: voltage2
+      name: "Voltage 2"
+    current_a:
+      id: current2
+      name: "Current 2"
+      filters:
+        - lambda: |-
+            if (x <= 0.02) return 0;
+            return x;
+    active_power_a:
+      id: power2
+      name: "Power 2"
+      filters:
+        - multiply: -1
+        - lambda: |-
+            if (x <= 0.2) return 0;
+            return x;
+
+  # --- Bus 0 (CH0) DS18B20 Sensors (Slots 1..5) ---
+  - platform: template
+    name: "CH0 DS18B20 1"
+    id: ch0_temp_1
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    filters:
+      - throttle: 5s
+  - platform: template
+    name: "CH0 DS18B20 2"
+    id: ch0_temp_2
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    filters:
+      - throttle: 5s
+  - platform: template
+    name: "CH0 DS18B20 3"
+    id: ch0_temp_3
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    filters:
+      - throttle: 5s
+  - platform: template
+    name: "CH0 DS18B20 4"
+    id: ch0_temp_4
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    filters:
+      - throttle: 5s
+  - platform: template
+    name: "CH0 DS18B20 5"
+    id: ch0_temp_5
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    filters:
+      - throttle: 5s
+
+  # --- Bus 1 (CH1) DS18B20 Sensors (Slots 1..5) ---
+  - platform: template
+    name: "CH1 DS18B20 1"
+    id: ch1_temp_1
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    filters:
+      - throttle: 5s
+  - platform: template
+    name: "CH1 DS18B20 2"
+    id: ch1_temp_2
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    filters:
+      - throttle: 5s
+  - platform: template
+    name: "CH1 DS18B20 3"
+    id: ch1_temp_3
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    filters:
+      - throttle: 5s
+  - platform: template
+    name: "CH1 DS18B20 4"
+    id: ch1_temp_4
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    filters:
+      - throttle: 5s
+  - platform: template
+    name: "CH1 DS18B20 5"
+    id: ch1_temp_5
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    filters:
+      - throttle: 5s
+
+  # --- Bus 0 (CH0) DHT22 Sensor ---
+  - platform: template
+    name: "CH0 DHT22 Temperature"
+    id: ch0_dht22_temp
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    filters:
+      - throttle: 5s
+  - platform: template
+    name: "CH0 DHT22 Humidity"
+    id: ch0_dht22_hum
+    unit_of_measurement: "%"
+    device_class: humidity
+    state_class: measurement
+    accuracy_decimals: 1
+    filters:
+      - throttle: 5s
+        
+  # --- Bus 1 (CH1) DHT22 Sensor ---
+  - platform: template
+    name: "CH1 DHT22 Temperature"
+    id: ch1_dht22_temp
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    filters:
+      - throttle: 5s
+  - platform: template
+    name: "CH1 DHT22 Humidity"
+    id: ch1_dht22_hum
+    unit_of_measurement: "%"
+    device_class: humidity
+    state_class: measurement
+    accuracy_decimals: 1
+    filters:
+      - throttle: 5s
+
+  # --- Analog Input 0 & 1 (Voltage & Percentage) ---
+  - platform: template
+    name: "Analog 0 Voltage"
+    id: analog0_v
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 2
+    filters:
+      - throttle: 1s
+  - platform: template
+    name: "Analog 0 Percentage"
+    id: analog0_pct
+    unit_of_measurement: "%"
+    state_class: measurement
+    accuracy_decimals: 1
+    filters:
+      - throttle: 1s
+  - platform: template
+    name: "Analog 1 Voltage"
+    id: analog1_v
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 2
+    filters:
+      - throttle: 1s
+  - platform: template
+    name: "Analog 1 Percentage"
+    id: analog1_pct
+    unit_of_measurement: "%"
+    state_class: measurement
+    accuracy_decimals: 1
+    filters:
+      - throttle: 1s
+
+script:
+  - id: scan_buses_script
+    mode: single
+    then:
+            # 0. Firmware-Info (0x30 -> Antwort 0xB0) active query to STM32
+      - lambda: |-
+          std::vector<uint8_t> info_cmd = {0xAA, 0x55, 0x02, 0x30, 0x00, 0xCE};
+          id(uart_bus_1).write_array(info_cmd.data(), info_cmd.size());
+      - delay: 50ms
+      - lambda: |-
+          id(is_scanning) = true;
+          id(ch0_roms).clear();
+          id(ch1_roms).clear();
+          id(ch0_rom_list).publish_state("Resetting & Scanning...");
+          id(ch1_rom_list).publish_state("Resetting & Scanning...");
+      # 1. Hardware-reset the STM32 so it detects newly connected sensors
+      # 2. Wait for STM32 boot (~3.2s)
+      - delay: 200ms
+      # 3. Scan CH0 (0x71 0x00 -> 0x72 0x00)
+      - lambda: |-
+          std::vector<uint8_t> f1_0 = {0xAA, 0x55, 0x02, 0x71, 0x00, 0x8D};
+          id(uart_bus_1).write_array(f1_0.data(), f1_0.size());
+      - delay: 50ms
+      - lambda: |-
+          std::vector<uint8_t> f2_0 = {0xAA, 0x55, 0x02, 0x72, 0x00, 0x8C};
+          id(uart_bus_1).write_array(f2_0.data(), f2_0.size());
+      - delay: 250ms
+      # 4. Scan CH1 (0x71 0x01 -> 0x72 0x01)
+      - lambda: |-
+          std::vector<uint8_t> f1_1 = {0xAA, 0x55, 0x02, 0x71, 0x01, 0x8C};
+          id(uart_bus_1).write_array(f1_1.data(), f1_1.size());
+      - delay: 50ms
+      - lambda: |-
+          std::vector<uint8_t> f2_1 = {0xAA, 0x55, 0x02, 0x72, 0x01, 0x8B};
+          id(uart_bus_1).write_array(f2_1.data(), f2_1.size());
+      - delay: 250ms
+      # 5. Publish discovered ROM IDs and resume round-robin polling
+      - lambda: |-
+          auto format_rom_list = [](const std::vector<std::vector<uint8_t>> &list) -> std::string {
+            if (list.empty()) return "None";
+            std::string out;
+            for (size_t i = 0; i < list.size(); i++) {
+              if (i > 0) out += " | ";
+              out += std::to_string(i + 1) + ": " + format_hex_pretty(list.at(i));
+            }
+            return out;
+          };
+          id(ch0_rom_list).publish_state(format_rom_list(id(ch0_roms)));
+          id(ch1_rom_list).publish_state(format_rom_list(id(ch1_roms)));
+          id(is_scanning) = false;
+
+# Necessary for ADE7953s to come out of reset
+# The reset pin is common to both ADE7953 chips
+output:
+  - platform: gpio
+    id: ade7953_reset
+    pin:
+      number: GPIO2
+      inverted: true
+      ignore_strapping_warning: true
+
+  - platform: ledc
+    pin: 
+      number: ${pin_addon_en}
+      allow_other_uses: true
+    id: addon_en_pwm
+    frequency: ${en_pwm_frequency}
+
+sn74hc595:
+  - id: 'sn74hc595_hub'
+    type: spi
+    latch_pin: GPIO4
+    sr_count: 1
+
+switch:
+  - platform: gpio
+    name: "Relay 1"
+    id: relay1
+    pin:
+      sn74hc595: sn74hc595_hub
+      number: 0
+      inverted: false
+
+  - platform: gpio
+    name: "Relay 2"
+    id: relay2
+    pin:
+      sn74hc595: sn74hc595_hub
+      number: 1
+      inverted: false
+
+  - platform: gpio
+    id: wifi_led_blue
+    pin:
+      sn74hc595: sn74hc595_hub
+      number: 2
+      inverted: true
+
+  - platform: gpio
+    id: wifi_led_green
+    pin:
+      sn74hc595: sn74hc595_hub
+      number: 3
+      inverted: true
+
+  - platform: gpio
+    id: wifi_led_red
+    pin:
+      sn74hc595: sn74hc595_hub
+      number: 4
+      inverted: true
+
+  - platform: gpio
+    id: lan_led_green
+    pin:
+      sn74hc595: sn74hc595_hub
+      number: 5       # Bit 5 controls dedicated green LAN-LED
+      inverted: true
+
+  - platform: template
+    name: "Addon Relay"
+    id: addon_relay_switch
+    lambda: |-
+      return id(addon_relay_state).state;
+    turn_on_action:
+      - lambda: |-
+          std::vector<uint8_t> cmd = {0xAA, 0x55, 0x02, 0x50, 0x00, 0xAE};
+          id(uart_bus_1).write_array(cmd.data(), cmd.size());
+    turn_off_action:
+      - lambda: |-
+          std::vector<uint8_t> cmd = {0xAA, 0x55, 0x02, 0x51, 0x00, 0xAD};
+          id(uart_bus_1).write_array(cmd.data(), cmd.size());
+      
+network:
+  priority:
+    - ethernet
+    - wifi
+      
+text_sensor:
+  - platform: template
+    name: "CH0 Discovered ROM IDs"
+    id: ch0_rom_list
+    icon: "mdi:identifier"
+
+  - platform: template
+    name: "CH1 Discovered ROM IDs"
+    id: ch1_rom_list
+    icon: "mdi:identifier"
+
+  - platform: template
+    name: "Addon Firmware Info"
+    id: addon_fw_info
+    icon: "mdi:chip"
+
+  - platform: template
+    name: "Addon Capabilities"
+    id: addon_capabilities
+    icon: "mdi:expansion-card"
+
+interval:
+  # 1. Master Round-Robin Poll Transmitter (100ms Takt)
+  - interval: ${poll_interval_ms}
+    then:
+      - lambda: |-
+          if (id(is_scanning)) return;
+
+          auto send_frame = [](const std::vector<uint8_t> &body) {
+            std::vector<uint8_t> pkt;
+            pkt.push_back(0xAA);
+            pkt.push_back(0x55);
+            pkt.push_back((uint8_t)body.size());
+            uint32_t sum = 0xAA + 0x55 + body.size();
+            for (uint8_t b : body) {
+              pkt.push_back(b);
+              sum += b;
+            }
+            pkt.push_back((uint8_t)(0xFF - (sum & 0xFF)));
+            id(uart_bus_1).write_array(pkt.data(), pkt.size());
+          };
+
+          // Aufbau der festen Abfragen (Index 0..4 sind immer aktiv)
+          std::vector<std::vector<uint8_t>> fixed_polls = {
+            {0x75, 0x00}, // 0: Digital IO0
+            {0x75, 0x01}, // 1: Digital IO1
+            {0x70, 0x00}, // 2: Analog 0
+            {0x70, 0x01}, // 3: Analog 1
+            {0x52, 0x00}  // 4: Relay Status
+          };
+          if (${poll_dht22_ch0}) fixed_polls.push_back({0x74, 0x00}); // Optional: DHT22 CH0
+          if (${poll_dht22_ch1}) fixed_polls.push_back({0x74, 0x01}); // Optional: DHT22 CH1
+
+          uint8_t fixed_count = fixed_polls.size();
+          uint8_t total_polls = fixed_count + id(ch0_roms).size() + id(ch1_roms).size();
+
+          if (id(poll_index) >= total_polls) {
+            id(poll_index) = 0;
+          }
+
+          uint8_t idx = id(poll_index);
+          id(poll_index)++;
+
+          if (idx < fixed_count) {
+            send_frame(fixed_polls.at(idx));
+          } else {
+            uint8_t rom_idx = idx - fixed_count;
+            if (rom_idx < id(ch0_roms).size()) {
+              std::vector<uint8_t> body = {0x73, 0x00};
+              const auto &rom = id(ch0_roms).at(rom_idx);
+              body.insert(body.end(), rom.begin(), rom.end());
+              send_frame(body);
+            } else {
+              uint8_t ch1_idx = rom_idx - id(ch0_roms).size();
+              if (ch1_idx < id(ch1_roms).size()) {
+                std::vector<uint8_t> body = {0x73, 0x01};
+                const auto &rom = id(ch1_roms).at(ch1_idx);
+                body.insert(body.end(), rom.begin(), rom.end());
+                send_frame(body);
+              }
+            }
+          }
+
+  # 2. UART RX Frame Parser & Checksum Verifier
+  - interval: 25ms
+    then:
+      - lambda: |-
+          while (id(uart_bus_1).available() >= 4) {
+            uint8_t first_byte = 0;
+            id(uart_bus_1).peek_byte(&first_byte);
+            if (first_byte != 0xAA) {
+              uint8_t dummy;
+              id(uart_bus_1).read_byte(&dummy);
+              continue;
+            }
+            std::array<uint8_t, 3> header{};
+            id(uart_bus_1).read_array(header.data(), 3);
+            if (header.at(1) != 0x55) {
+              continue;
+            }
+            uint8_t payload_len = header.at(2);
+            uint8_t rem_len = payload_len + 1;
+
+            uint32_t start = millis();
+            while (id(uart_bus_1).available() < rem_len && (millis() - start) < 15) {
+              delay(1);
+            }
+            if (id(uart_bus_1).available() < rem_len) {
+              break;
+            }
+
+            std::vector<uint8_t> data(rem_len);
+            id(uart_bus_1).read_array(data.data(), rem_len);
+
+            uint32_t sum = 0xAA + 0x55 + payload_len;
+            for (uint8_t i = 0; i < payload_len; i++) {
+              sum += data.at(i);
+            }
+            uint8_t expected_cs = (uint8_t)(0xFF - (sum & 0xFF));
+            if (data.at(payload_len) != expected_cs) {
+              continue;
+            }
+
+            uint8_t cmd = data.at(0);
+
+            if (cmd == 0xB0 && payload_len >= 14) {
+              std::string fw_str = "FW v" + std::to_string(data.at(10)) + "." +
+                                   (data.at(11) < 10 ? "0" : "") + std::to_string(data.at(11)) +
+                                   " (Build " + std::to_string(data.at(12)) + "/" + std::to_string(data.at(13)) + ")";
+              id(addon_fw_info).publish_state(fw_str);
+
+              std::vector<uint8_t> cap_bytes(data.begin() + 1, data.begin() + 10);
+              id(addon_capabilities).publish_state(format_hex_pretty(cap_bytes));
+            } else if (cmd == 0xF2 && payload_len == 0x0C && data.at(1) == 0x00) {
+              uint8_t ch = data.at(2);
+              std::vector<uint8_t> rom(data.begin() + 4, data.begin() + 12);
+              if (ch == 0x00 && id(ch0_roms).size() < 5) {
+                id(ch0_roms).push_back(rom);
+              } else if (ch == 0x01 && id(ch1_roms).size() < 5) {
+                id(ch1_roms).push_back(rom);
+              }
+            } else if (cmd == 0xF3 && payload_len == 0x0D && data.at(1) == 0x00) {
+              uint8_t ch = data.at(2);
+              std::vector<uint8_t> rx_rom(data.begin() + 3, data.begin() + 11);
+              int16_t raw_temp = (int16_t)((data.at(11) << 8) | data.at(12));
+              float temp_c = raw_temp / 10.0f;
+
+              if (temp_c > -55.0f && temp_c < 125.0f) {
+                if (ch == 0x00) {
+                  std::array<sensor::Sensor*, 5> s0 = {
+                    id(ch0_temp_1), id(ch0_temp_2), id(ch0_temp_3), id(ch0_temp_4), id(ch0_temp_5)
+                  };
+                  for (size_t i = 0; i < id(ch0_roms).size() && i < 5; i++) {
+                    if (id(ch0_roms).at(i) == rx_rom) {
+                      s0.at(i)->publish_state(temp_c);
+                      break;
+                    }
+                  }
+                } else if (ch == 0x01) {
+                  std::array<sensor::Sensor*, 5> s1 = {
+                    id(ch1_temp_1), id(ch1_temp_2), id(ch1_temp_3), id(ch1_temp_4), id(ch1_temp_5)
+                  };
+                  for (size_t i = 0; i < id(ch1_roms).size() && i < 5; i++) {
+                    if (id(ch1_roms).at(i) == rx_rom) {
+                      s1.at(i)->publish_state(temp_c);
+                      break;
+                    }
+                  }
+                }
+              }
+            } else if (cmd == 0xF4 && payload_len == 0x07 && data.at(1) == 0x00) {
+              uint8_t ch = data.at(2);
+              int16_t raw_temp = (int16_t)((data.at(3) << 8) | data.at(4));
+              uint16_t raw_hum = (uint16_t)((data.at(5) << 8) | data.at(6));
+              if (ch == 0x00) {
+                id(ch0_dht22_temp).publish_state(raw_temp / 10.0f);
+                id(ch0_dht22_hum).publish_state(raw_hum / 10.0f);
+              } else if (ch == 0x01) {
+                id(ch1_dht22_temp).publish_state(raw_temp / 10.0f);
+                id(ch1_dht22_hum).publish_state(raw_hum / 10.0f);
+              }
+            } else if (cmd == 0xF5 && payload_len == 0x04 && data.at(1) == 0x00) {
+              if (data.at(2) == 0x00) {
+                id(addon_io0).publish_state(data.at(3) == 0x01);
+              } else if (data.at(2) == 0x01) {
+                id(addon_io1).publish_state(data.at(3) == 0x01);
+              }
+            } else if (cmd == 0xF0 && payload_len == 0x07 && data.at(1) == 0x00) {
+              uint32_t raw = ((uint32_t)data.at(3) << 24) |
+                             ((uint32_t)data.at(4) << 16) |
+                             ((uint32_t)data.at(5) << 8)  |
+                             (uint32_t)data.at(6);
+              if (data.at(2) == 0x00) {
+                float max_r = ${analog0_max_raw};
+                float max_v = ${analog0_max_v};
+                id(analog0_v).publish_state((raw / max_r) * max_v);
+                id(analog0_pct).publish_state((raw / max_r) * 100.0f);
+              } else if (data.at(2) == 0x01) {
+                float max_r = ${analog1_max_raw};
+                float max_v = ${analog1_max_v};
+                id(analog1_v).publish_state((raw / max_r) * max_v);
+                id(analog1_pct).publish_state((raw / max_r) * 100.0f);
+              }
+            } else if ((cmd == 0xD0 || cmd == 0xD1 || cmd == 0xD2) && payload_len == 0x04) {
+              id(addon_relay_state).publish_state(data.at(3) == 0x01);
+            }
+          }
